@@ -95,7 +95,7 @@ def build_welcome_caption(first_name: str | None) -> str:
     return "\n".join([
         f"👋 <b>Welcome to NextChamp, {esc(name)}!</b>",
         "",
-        "🏆 Challenge Real Opponents. Play. Compete. Prove Your Skills. Become a Champion!",
+        "Challenge real opponents. Stake. Win. Climb the ranks.",
         "",
         "Use the buttons below to get started 👇",
     ])
@@ -235,7 +235,6 @@ _NOTIF_EMOJI = {
     # ── Wallet & Treasury ──
     "DEPOSIT_CONFIRMED": "💰",
     "WITHDRAWAL_REQUESTED": "⏳",
-    # Defensive — not currently emitted, kept in case the backend adds them:
     "WITHDRAWAL_APPROVED": "💸",
     "WITHDRAWAL_REJECTED": "❌",
 
@@ -260,6 +259,12 @@ _NOTIF_EMOJI = {
     "MATCH_DRAW": "🤝",
     "MATCH_CANCELLED": "❌",
 
+    # ── Rematch ──
+    "REMATCH_REQUESTED": "🔄",
+    "REMATCH_ACCEPTED": "✅",
+    "REMATCH_CANCELED": "🚫",
+    "REMATCH_EXPIRED": "⏳",
+
     # ── System ──
     "BROADCAST": "📢",
 }
@@ -271,8 +276,11 @@ _NOTIF_EMOJI = {
 _NOTIF_SUFFIX = {
     "CHALLENGE_ACCEPTED": "👉 Set the room code now to start the match.",
     "OPPONENT_READY": "👉 Enter the room code and confirm ready in the app.",
+    "RESULT_SUBMISSION_REQUIRED": "👉 Submit your result before the dispute window closes.",
+    "RESULT_SUBMITTED_BY_OPPONENT": "👉 Submit your result to confirm or dispute the outcome.",
     "DISPUTE_OPENED": "👉 Upload your proof to support your claim.",
     "DISPUTE_EVIDENCE_SUBMITTED": "👉 Upload your evidence to respond.",
+    "REMATCH_REQUESTED": "👉 Open the app to accept or decline the rematch.",
 }
 
 

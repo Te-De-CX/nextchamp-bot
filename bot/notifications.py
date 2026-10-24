@@ -1,7 +1,5 @@
 import asyncio
-import hashlib
 import logging
-import time
 
 from aiogram.exceptions import TelegramAPIError, TelegramForbiddenError
 from aiogram.types import LinkPreviewOptions
@@ -14,15 +12,6 @@ log = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL_MS = 10_000
 BATCH_LIMIT = 50
-
-# ← NEW: dedup window. Same (user, eventType, identifier) within this
-# window is treated as a duplicate and silently skipped.
-_DEDUP_WINDOW_SECONDS = 15 * 60  # 15 minutes
-
-# ← NEW: in-memory dedup cache. Key → last-delivered timestamp.
-# Survives until restart, which is fine: the window is 15 min, and
-# after a restart the risk is a single duplicate at worst.
-_dedup_cache: dict[str, float] = {}
 
 
 def _classify_forbidden(err: TelegramForbiddenError) -> str:
@@ -54,62 +43,12 @@ def _classify_forbidden(err: TelegramForbiddenError) -> str:
     return "unknown"
 
 
-# ──────────────────────────────────────────────────────────────────
-# Dedup helpers (NEW)
-# ──────────────────────────────────────────────────────────────────
-
-def _build_dedup_key(notif: dict, tg_id: int) -> str | None:
-    """
-    Stable key for deduplication within the window.
-
-    Prefers the natural identifier from the payload (matchId / reference /
-    disputeId). Falls back to a content hash for events without one.
-
-    Returns None for events we never want to dedup (BROADCAST — the admin
-    may legitimately want to send the same message twice).
-    """
-    event_type = str(notif.get("eventType") or "").strip()
-    data = notif.get("data") or {}
-
-    # Admin broadcasts are intentional. Never dedup them.
-    if event_type == "BROADCAST":
-        return None
-
-    identifier = (
-        data.get("matchId")
-        or data.get("reference")
-        or data.get("disputeId")
-    )
-    if identifier:
-        return f"{tg_id}:{event_type}:{identifier}"
-
-    # Fallback: content hash. Catches duplicate event types that don't
-    # carry a natural identifier.
-    content = f"{notif.get('title', '')}|{notif.get('message', '')}"
-    h = hashlib.md5(content.encode("utf-8")).hexdigest()[:12]
-    return f"{tg_id}:{event_type}:{h}"
-
-
-def _prune_dedup_cache() -> int:
-    """Drop entries older than the window. Returns count pruned."""
-    if not _dedup_cache:
-        return 0
-    cutoff = time.time() - _DEDUP_WINDOW_SECONDS
-    stale = [k for k, ts in _dedup_cache.items() if ts < cutoff]
-    for k in stale:
-        del _dedup_cache[k]
-    return len(stale)
-
-
-# ──────────────────────────────────────────────────────────────────
-
 async def _deliver_one(notif: dict) -> tuple[bool, str]:
     """
     Deliver a single notification.
 
     Returns (should_ack, outcome) where outcome is one of:
       "delivered"      — DM sent successfully
-      "duplicate"      — suppressed by dedup cache (NEW)
       "skipped"        — no telegramId (user hasn't linked Telegram)
       "blocked"        — user blocked the bot; marked blocked in DB
       "never_started"  — user never tapped /start (NOT marked as blocked)
@@ -135,15 +74,6 @@ async def _deliver_one(notif: dict) -> tuple[bool, str]:
         )
         return True, "bad_id"
 
-    # ← NEW: dedup check before rendering/sending
-    dedup_key = _build_dedup_key(notif, tg_id)
-    if dedup_key is not None and dedup_key in _dedup_cache:
-        log.info(
-            "[notif] duplicate %s (%s) → %s — skipping",
-            notif_id, event_type, tg_id,
-        )
-        return True, "duplicate"
-
     text = render_notification(notif)
     markup = build_notification_button(notif)
 
@@ -154,18 +84,11 @@ async def _deliver_one(notif: dict) -> tuple[bool, str]:
             reply_markup=markup,
             link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
-        # Record on success only, so a failed send still retries.
-        if dedup_key is not None:
-            _dedup_cache[dedup_key] = time.time()
         log.info("[notif] delivered %s (%s) → %s", notif_id, event_type, tg_id)
         return True, "delivered"
 
     except TelegramForbiddenError as e:
         kind = _classify_forbidden(e)
-
-        # Record the key for every Forbidden variant — retrying won't help.
-        if dedup_key is not None:
-            _dedup_cache[dedup_key] = time.time()
 
         if kind == "blocked":
             log.info(
@@ -196,9 +119,7 @@ async def _deliver_one(notif: dict) -> tuple[bool, str]:
         return True, "forbidden"
 
     except TelegramAPIError as e:
-        # Record the key — retrying an API-rejected message won't help.
-        if dedup_key is not None:
-            _dedup_cache[dedup_key] = time.time()
+        # Chat not found, message too long, etc. Retrying won't help.
         log.warning(
             "[notif] telegram API error for %s → %s: %s: %s",
             notif_id, tg_id, type(e).__name__, e or "(no message)",
@@ -206,7 +127,7 @@ async def _deliver_one(notif: dict) -> tuple[bool, str]:
         return True, "api_error"
 
     except Exception as e:
-        # Do NOT record the key — we want the next cycle to retry.
+        # Network blip, timeout, unknown — retry next cycle.
         log.warning(
             "[notif] transient error for %s → %s: %s: %s",
             notif_id, tg_id, type(e).__name__, e or "(no message)",
@@ -215,11 +136,6 @@ async def _deliver_one(notif: dict) -> tuple[bool, str]:
 
 
 async def poll_once() -> None:
-    # ← NEW: prune stale dedup entries once per cycle
-    pruned = _prune_dedup_cache()
-    if pruned:
-        log.debug("[notif] pruned %d stale dedup entries", pruned)
-
     try:
         notifications = await api.pending_notifications(limit=BATCH_LIMIT)
     except Exception as e:
@@ -236,7 +152,6 @@ async def poll_once() -> None:
     ack_ids: list[str] = []
     counts = {
         "delivered": 0,
-        "duplicate": 0,
         "skipped": 0,
         "blocked": 0,
         "never_started": 0,
@@ -267,13 +182,12 @@ async def poll_once() -> None:
             )
 
     log.info(
-        "[notif] cycle: delivered=%d duplicate=%d skipped=%d blocked=%d "
-        "never_started=%d deactivated=%d forbidden=%d bad_id=%d "
-        "api_error=%d retry=%d | acked=%d",
-        counts["delivered"], counts["duplicate"], counts["skipped"],
-        counts["blocked"], counts["never_started"], counts["deactivated"],
-        counts["forbidden"], counts["bad_id"], counts["api_error"],
-        counts["retry"], acked,
+        "[notif] cycle: delivered=%d skipped=%d blocked=%d never_started=%d "
+        "deactivated=%d forbidden=%d bad_id=%d api_error=%d retry=%d | acked=%d",
+        counts["delivered"], counts["skipped"], counts["blocked"],
+        counts["never_started"], counts["deactivated"], counts["forbidden"],
+        counts["bad_id"], counts["api_error"], counts["retry"],
+        acked,
     )
 
 
@@ -284,10 +198,7 @@ async def run_forever(interval_ms: int = DEFAULT_INTERVAL_MS) -> None:
     """
     interval = max(1.0, interval_ms / 1000.0)
     loop = asyncio.get_running_loop()
-    log.info(
-        "[notif] poller started, interval=%ds, dedup window=%ds",
-        int(interval), _DEDUP_WINDOW_SECONDS,
-    )
+    log.info("[notif] poller started, interval=%ds", int(interval))
 
     while True:
         cycle_start = loop.time()
